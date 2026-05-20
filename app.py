@@ -476,7 +476,7 @@ if selected == "儀表板":
     top_sites.insert(0, "排名", range(1, len(top_sites) + 1))
     top_sites["佔比"] = (top_sites["總服務費"] / v_total * 100).round(1).astype(str) + "%" if v_total else "0.0%"
     st.dataframe(
-        op_sites.style.format({"總服務費": "{:,.0f}"}),
+        top_sites.style.format({"總服務費": "{:,.0f}"}),
         use_container_width=True,
         hide_index=True,
     )
