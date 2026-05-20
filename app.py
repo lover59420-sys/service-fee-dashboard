@@ -273,13 +273,14 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # 名稱修正
     if df["業者"].dtype == "object":
         df["業者"] = (
+            df["業者"]
             .astype(str)
             .str.strip()
             .str.replace("?亭", "俥亭", regex=False)
             .str.replace("？亭", "俥亭", regex=False)
             .str.replace("俥亭停車", "俥亭", regex=False)
             .str.replace("?萊", "萊", regex=False)
-    )
+        )
     return df
 
 def find_local_workbook() -> Optional[Path]:
