@@ -273,7 +273,6 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # 名稱修正
     if df["業者"].dtype == "object":
         df["業者"] = (
-            df["業者"]
             .astype(str)
             .str.strip()
             .str.replace("?亭", "俥亭", regex=False)
