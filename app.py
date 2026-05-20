@@ -167,12 +167,49 @@ def get_quarter(month_str):
 
 @st.cache_data(show_spinner=False)
 def load_data_from_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    return prepare_dataframe(df)
+    excel = pd.ExcelFile(io.BytesIO(file_bytes))
+    last_error: Exception | None = None
+
+    # 依序嘗試每個工作表，找到第一個真的有資料的表
+    for sheet_name in excel.sheet_names:
+        try:
+            df = pd.read_excel(excel, sheet_name=sheet_name, dtype=object)
+            df = prepare_dataframe(df)
+            if not df.empty:
+                return df
+        except Exception as e:
+            last_error = e
+
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Excel 沒有可用的資料表，或工作表內容為空白。")
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().replace("\n", "").replace("\r", "") for c in df.columns]
+    # 去除全空白列
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df
+
+
+def _parse_year_month(value) -> tuple[str, str]:
+    text = "" if pd.isna(value) else str(value).strip()
+    if not text:
+        return "", ""
+
+    # 常見格式：114/01、114-01、11401、2024/01、2024-01
+    m = re.search(r"(?P<year>\d{2,4})\D*(?P<month>\d{1,2})", text)
+    if not m:
+        return text, ""
+
+    year = m.group("year")
+    month = m.group("month").zfill(2)
+    return year, month
 
 
 def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df = _normalize_columns(df)
 
     # 數字欄位清理
     for col in NUMERIC_COLS:
@@ -184,9 +221,17 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col not in df.columns:
             raise ValueError(f"Excel 缺少必要欄位：{col}")
 
+    # 若年月是類似 114/01，拆成年份/月分；若只有 11401 也可解析
+    ym_parts = df["年月"].apply(_parse_year_month)
+    df["年份"] = ym_parts.apply(lambda x: str(x[0]))
+    df["月份"] = ym_parts.apply(lambda x: str(x[1]))
+    df["季度"] = df["月份"].apply(get_quarter)
+    df["年季"] = df["年份"] + " " + df["季度"]
+
     yt_parking = df["臨停應收佣金"] if "臨停應收佣金" in df.columns else df.get("遠通臨停佣金", 0)
     yt_monthly = df["月租應收佣金"] if "月租應收佣金" in df.columns else df.get("遠通月租佣金", 0)
 
+    # 兜底：如果使用者表裡已經有總服務費，就保留；否則由各項自動加總
     df["遠通臨停"] = yt_parking + df.get("遠通中獎通知", 0)
     df["遠通月租"] = yt_monthly
 
@@ -205,17 +250,21 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     df["遠創臨停"] = df[fechuang_parking_cols].sum(axis=1)
     df["遠創月租"] = df["月租代收應收服務費"]
-    df["總服務費"] = df["遠通臨停"] + df["遠通月租"] + df["遠創臨停"] + df["遠創月租"]
 
-    # 年月欄位推導
-    ym = df["年月"].astype(str).str.split("/", n=1, expand=True)
-    df["年份"] = ym[0]
-    df["月份"] = ym[1].fillna("")
-    df["季度"] = df["月份"].apply(get_quarter)
-    df["年季"] = df["年份"] + " " + df["季度"]
+    if "總服務費" in df.columns:
+        df["總服務費"] = df["總服務費"].apply(clean_numeric).fillna(0)
+        zero_mask = df["總服務費"].isna() | (df["總服務費"] == 0)
+        df.loc[zero_mask, "總服務費"] = (
+            df.loc[zero_mask, "遠通臨停"]
+            + df.loc[zero_mask, "遠通月租"]
+            + df.loc[zero_mask, "遠創臨停"]
+            + df.loc[zero_mask, "遠創月租"]
+        )
+    else:
+        df["總服務費"] = df["遠通臨停"] + df["遠通月租"] + df["遠創臨停"] + df["遠創月租"]
 
     # 名稱修正
-    if df["業者"].dtype == "object":
+    if "業者" in df.columns and df["業者"].dtype == "object":
         df["業者"] = (
             df["業者"]
             .astype(str)
@@ -223,65 +272,10 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             .str.replace("?萊", "萊", regex=False)
         )
 
+    # 空白業者列通常不是有效資料
+    df = df[df["業者"].astype(str).str.strip().ne("")].reset_index(drop=True)
+
     return df
-
-
-def find_local_workbook() -> Path | None:
-    candidates = [
-        Path("0505_merged.xlsx"),
-        Path("0505.xlsx"),
-        Path(__file__).with_name("0505_merged.xlsx"),
-        Path(__file__).with_name("0505.xlsx"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
-
-def get_data_source():
-    """
-    Returns either:
-    - ("uploaded", filename, bytes)
-    - ("local", filename, bytes)
-    - (None, None, None)
-    """
-    uploaded = st.session_state.get("uploaded_file")
-    if uploaded is not None:
-        return "uploaded", uploaded["name"], uploaded["bytes"]
-
-    local = find_local_workbook()
-    if local is not None:
-        return "local", local.name, local.read_bytes()
-
-    return None, None, None
-
-
-def ensure_dataframe() -> pd.DataFrame | None:
-    source_type, filename, file_bytes = get_data_source()
-    if source_type is None:
-        return None
-
-    try:
-        df = load_data_from_bytes(file_bytes, filename)
-        st.session_state["data_filename"] = filename
-        st.session_state["data_source_type"] = source_type
-        return df
-    except Exception as e:
-        st.session_state["data_error"] = str(e)
-        return None
-
-
-def upload_to_session(uploaded_file):
-    if uploaded_file is None:
-        return
-    st.session_state["uploaded_file"] = {
-        "name": uploaded_file.name,
-        "bytes": uploaded_file.getvalue(),
-    }
-    st.session_state["data_error"] = None
-    st.cache_data.clear()
-    st.rerun()
 
 
 def money(x):
