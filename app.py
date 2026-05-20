@@ -273,15 +273,9 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # 名稱修正
     if "業者" in df.columns:
         df["業者"] = df["業者"].astype(str).str.strip()
-        df["業者"] = df["業者"].replace({
-            "?亭": "俥亭",
-            "？亭": "俥亭",
-            "俥亭停車": "俥亭",
-            "?萊": "萊",
-            "？萊": "萊",
-        })
+        df["業者"] = df["業者"].replace({"?亭": "俥亭","？亭": "俥亭","俥亭停車": "俥亭","?萊": "萊","？萊": "萊",})
 
-return df
+    return df
 
 def find_local_workbook() -> Optional[Path]:
     candidates = [
