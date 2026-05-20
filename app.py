@@ -1,6 +1,7 @@
 # Deploy with: streamlit run app.py
 import io
 from pathlib import Path
+from typing import Optional, Tuple
 
 import pandas as pd
 import plotly.express as px
@@ -153,7 +154,7 @@ def clean_numeric(x):
 
 def get_quarter(month_str):
     try:
-        m = int(month_str)
+        m = int(str(month_str).strip())
         if m <= 3:
             return "Q1"
         if m <= 6:
@@ -165,30 +166,75 @@ def get_quarter(month_str):
         return "N/A"
 
 
-@st.cache_data(show_spinner=False)
-def load_data_from_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes))
+def money(x):
+    try:
+        if pd.isna(x):
+            return "$0"
+        return f"${float(x):,.0f}"
+    except Exception:
+        return "$0"
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def read_excel_any(file_bytes: bytes) -> pd.DataFrame:
+    # Try all sheets and pick the first sheet that contains data rows.
+    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    last_df = None
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
+            df = normalize_columns(df)
+            # drop fully empty rows
+            df = df.dropna(how="all")
+            last_df = df
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    if last_df is not None:
+        return last_df
+    return pd.DataFrame()
+
+
+def load_data_from_bytes(file_bytes: bytes) -> pd.DataFrame:
+    df = read_excel_any(file_bytes)
     return prepare_dataframe(df)
 
 
 def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df = normalize_columns(df)
+    df = df.dropna(how="all").copy()
+
+    if df.empty:
+        return df
 
     # 數字欄位清理
     for col in NUMERIC_COLS:
         if col in df.columns:
             df[col] = df[col].apply(clean_numeric).fillna(0)
 
-    # 欄位存在性保護
-    for col in ["年月", "業者"]:
-        if col not in df.columns:
-            raise ValueError(f"Excel 缺少必要欄位：{col}")
+    # 必要欄位
+    required = ["年月", "業者"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Excel 缺少必要欄位：{', '.join(missing)}")
 
+    # 有些檔案把資料當作第一列文字時，先排除純表頭列
+    # （如果年月只有單一值但業者也存在，仍可處理）
+    df["年月"] = df["年月"].astype(str).str.strip()
+    df["業者"] = df["業者"].astype(str).str.strip()
+
+    # 可能的欄位別名
     yt_parking = df["臨停應收佣金"] if "臨停應收佣金" in df.columns else df.get("遠通臨停佣金", 0)
     yt_monthly = df["月租應收佣金"] if "月租應收佣金" in df.columns else df.get("遠通月租佣金", 0)
 
-    df["遠通臨停"] = yt_parking + df.get("遠通中獎通知", 0)
-    df["遠通月租"] = yt_monthly
+    df["遠通臨停"] = yt_parking.fillna(0) + df.get("遠通中獎通知", 0).fillna(0)
+    df["遠通月租"] = yt_monthly.fillna(0)
 
     fechuang_parking_cols = [
         "uTagGO易付",
@@ -202,15 +248,25 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in fechuang_parking_cols + ["月租代收應收服務費"]:
         if col not in df.columns:
             df[col] = 0
+        df[col] = df[col].apply(clean_numeric).fillna(0)
 
     df["遠創臨停"] = df[fechuang_parking_cols].sum(axis=1)
     df["遠創月租"] = df["月租代收應收服務費"]
-    df["總服務費"] = df["遠通臨停"] + df["遠通月租"] + df["遠創臨停"] + df["遠創月租"]
+
+    # 若 Excel 已有總服務費就保留，否則重算
+    if "總服務費" in df.columns:
+        df["總服務費"] = df["總服務費"].apply(clean_numeric).fillna(0)
+        if df["總服務費"].eq(0).all():
+            df["總服務費"] = df["遠通臨停"] + df["遠通月租"] + df["遠創臨停"] + df["遠創月租"]
+    else:
+        df["總服務費"] = df["遠通臨停"] + df["遠通月租"] + df["遠創臨停"] + df["遠創月租"]
 
     # 年月欄位推導
-    ym = df["年月"].astype(str).str.split("/", n=1, expand=True)
-    df["年份"] = ym[0]
-    df["月份"] = ym[1].fillna("")
+    ym = df["年月"].astype(str).str.replace("-", "/", regex=False).str.split("/", n=1, expand=True)
+    df["年份"] = ym[0].fillna("").astype(str).str.strip()
+    df["月份"] = ym[1].fillna("").astype(str).str.strip() if ym.shape[1] > 1 else ""
+    if not isinstance(df["月份"], pd.Series):
+        df["月份"] = ""
     df["季度"] = df["月份"].apply(get_quarter)
     df["年季"] = df["年份"] + " " + df["季度"]
 
@@ -221,12 +277,13 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             .astype(str)
             .str.replace("?亭", "俥亭", regex=False)
             .str.replace("?萊", "萊", regex=False)
+            .str.strip()
         )
 
     return df
 
 
-def find_local_workbook() -> Path | None:
+def find_local_workbook() -> Optional[Path]:
     candidates = [
         Path("0505_merged.xlsx"),
         Path("0505.xlsx"),
@@ -239,56 +296,24 @@ def find_local_workbook() -> Path | None:
     return None
 
 
-def get_data_source():
-    """
-    Returns either:
-    - ("uploaded", filename, bytes)
-    - ("local", filename, bytes)
-    - (None, None, None)
-    """
-    uploaded = st.session_state.get("uploaded_file")
-    if uploaded is not None:
-        return "uploaded", uploaded["name"], uploaded["bytes"]
+def get_df_from_sources(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    # 優先使用上傳檔案；沒有上傳才找本機/Repo 內 Excel
+    if uploaded_file is not None:
+        try:
+            df = load_data_from_bytes(uploaded_file.getvalue())
+            return df, uploaded_file.name
+        except Exception as e:
+            return None, f"讀取上傳 Excel 失敗：{e}"
 
     local = find_local_workbook()
     if local is not None:
-        return "local", local.name, local.read_bytes()
+        try:
+            df = load_data_from_bytes(local.read_bytes())
+            return df, local.name
+        except Exception as e:
+            return None, f"讀取本機 Excel 失敗：{e}"
 
-    return None, None, None
-
-
-def ensure_dataframe() -> pd.DataFrame | None:
-    source_type, filename, file_bytes = get_data_source()
-    if source_type is None:
-        return None
-
-    try:
-        df = load_data_from_bytes(file_bytes, filename)
-        st.session_state["data_filename"] = filename
-        st.session_state["data_source_type"] = source_type
-        return df
-    except Exception as e:
-        st.session_state["data_error"] = str(e)
-        return None
-
-
-def upload_to_session(uploaded_file):
-    if uploaded_file is None:
-        return
-    st.session_state["uploaded_file"] = {
-        "name": uploaded_file.name,
-        "bytes": uploaded_file.getvalue(),
-    }
-    st.session_state["data_error"] = None
-    st.cache_data.clear()
-    st.rerun()
-
-
-def money(x):
-    try:
-        return f"${float(x):,.0f}"
-    except Exception:
-        return "$0"
+    return None, None
 
 
 # -----------------------------
@@ -321,50 +346,47 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("資料來源")
-    current_name = st.session_state.get("data_filename", "尚未載入")
-    st.write(current_name)
-
-    if st.button("清除已上傳資料", use_container_width=True):
-        st.session_state.pop("uploaded_file", None)
-        st.session_state.pop("data_filename", None)
-        st.session_state.pop("data_source_type", None)
-        st.session_state.pop("data_error", None)
-        st.cache_data.clear()
-        st.rerun()
 
     st.markdown("### 上傳 Excel")
     uploaded_file = st.file_uploader("選擇 Excel 檔案", type=["xlsx", "xls"], label_visibility="collapsed")
-    if uploaded_file is not None:
-        upload_to_session(uploaded_file)
+
+    if st.button("重新讀取資料", use_container_width=True):
+        st.rerun()
 
 # -----------------------------
 # Load data
 # -----------------------------
-df = ensure_dataframe()
+df, data_msg = get_df_from_sources(uploaded_file)
 
 if df is None:
     st.title(APP_TITLE)
-    if st.session_state.get("data_error"):
-        st.error(f"讀取 Excel 失敗：{st.session_state['data_error']}")
+    if data_msg:
+        st.error(data_msg)
     else:
-        st.info("請在左側上傳 Excel 檔案。部署後使用者也可以直接上傳，不需要把檔案放在伺服器固定路徑。")
+        st.info("請在左側上傳 Excel 檔案。")
     st.stop()
-    raise SystemExit(0)
+
+st.sidebar.write(f"目前資料：{uploaded_file.name if uploaded_file is not None else (find_local_workbook().name if find_local_workbook() else '尚未載入')}")
+
+if df.empty:
+    st.title(APP_TITLE)
+    st.warning("這個 Excel 只有欄位標題，沒有資料列，所以無法顯示儀表板。請上傳有資料的版本。")
+    st.stop()
 
 # -----------------------------
 # Filter logic
 # -----------------------------
 if time_unit == "按月":
-    time_options = sorted(df["年月"].dropna().astype(str).unique(), reverse=True)
-    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options))
+    time_options = sorted([x for x in df["年月"].dropna().astype(str).unique().tolist() if x and x.lower() != "nan"], reverse=True)
+    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options)) if time_options else "全部"
     trend_col = "年月"
 elif time_unit == "按季":
-    time_options = sorted(df["年季"].dropna().astype(str).unique(), reverse=True)
-    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options))
+    time_options = sorted([x for x in df["年季"].dropna().astype(str).unique().tolist() if x and x.lower() != "nan"], reverse=True)
+    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options)) if time_options else "全部"
     trend_col = "年季"
 else:
-    time_options = sorted(df["年份"].dropna().astype(str).unique(), reverse=True)
-    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options))
+    time_options = sorted([x for x in df["年份"].dropna().astype(str).unique().tolist() if x and x.lower() != "nan"], reverse=True)
+    selected_time = st.sidebar.selectbox("選擇時間範圍", ["全部"] + list(time_options)) if time_options else "全部"
     trend_col = "年份"
 
 filtered_df = df.copy()
@@ -384,36 +406,21 @@ if selected == "儀表板":
     if filtered_df.empty:
         st.warning("目前篩選條件下沒有資料。")
         st.stop()
-    raise SystemExit(0)
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    v1, v2, v3, v4, v_total = filtered_df[["遠通臨停", "遠通月租", "遠創臨停", "遠創月租", "總服務費"]].sum()
+    sums = filtered_df[["遠通臨停", "遠通月租", "遠創臨停", "遠創月租", "總服務費"]].sum(numeric_only=True)
+    v1, v2, v3, v4, v_total = [float(sums.get(c, 0) or 0) for c in ["遠通臨停", "遠通月租", "遠創臨停", "遠創月租", "總服務費"]]
 
     with k1:
-        st.markdown(
-            f'<div class="kpi-card"><div class="kpi-icon">🚗</div><div class="kpi-label">遠通臨停服務費</div><div class="kpi-value">{money(v1)}</div><div class="kpi-sub">臨停應收 + 遠通中獎</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon">🚗</div><div class="kpi-label">遠通臨停服務費</div><div class="kpi-value">{money(v1)}</div><div class="kpi-sub">臨停應收 + 遠通中獎</div></div>', unsafe_allow_html=True)
     with k2:
-        st.markdown(
-            f'<div class="kpi-card"><div class="kpi-icon">📅</div><div class="kpi-label">遠通月租服務費</div><div class="kpi-value">{money(v2)}</div><div class="kpi-sub">月租應收佣金</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon">📅</div><div class="kpi-label">遠通月租服務費</div><div class="kpi-value">{money(v2)}</div><div class="kpi-sub">月租應收佣金</div></div>', unsafe_allow_html=True)
     with k3:
-        st.markdown(
-            f'<div class="kpi-card"><div class="kpi-icon">📱</div><div class="kpi-label">遠創臨停服務費</div><div class="kpi-value">{money(v3)}</div><div class="kpi-sub">uTagGO + APS + 充電</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon">📱</div><div class="kpi-label">遠創臨停服務費</div><div class="kpi-value">{money(v3)}</div><div class="kpi-sub">uTagGO + APS + 充電</div></div>', unsafe_allow_html=True)
     with k4:
-        st.markdown(
-            f'<div class="kpi-card"><div class="kpi-icon">🏠</div><div class="kpi-label">遠創月租服務費</div><div class="kpi-value">{money(v4)}</div><div class="kpi-sub">月租代收應收服務費</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon">🏠</div><div class="kpi-label">遠創月租服務費</div><div class="kpi-value">{money(v4)}</div><div class="kpi-sub">月租代收應收服務費</div></div>', unsafe_allow_html=True)
     with k5:
-        st.markdown(
-            f'<div class="kpi-card kpi-total"><div class="kpi-icon">💰</div><div class="kpi-label">總服務費</div><div class="kpi-value">{money(v_total)}</div><div class="kpi-sub">以上四項加總</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(f'<div class="kpi-card kpi-total"><div class="kpi-icon">💰</div><div class="kpi-label">總服務費</div><div class="kpi-value">{money(v_total)}</div><div class="kpi-sub">以上四項加總</div></div>', unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:2rem;'></div>", unsafe_allow_html=True)
 
@@ -430,77 +437,34 @@ if selected == "儀表板":
         t_df["遠創合計"] = t_df["遠創臨停"] + t_df["遠創月租"]
 
         fig_trend = go.Figure()
-        fig_trend.add_trace(
-            go.Scatter(
-                x=t_df[trend_col],
-                y=t_df["遠通合計"],
-                name="遠通合計",
-                line=dict(width=3),
-                fill="tozeroy",
-                fillcolor="rgba(59,130,246,0.05)",
-            )
-        )
-        fig_trend.add_trace(
-            go.Scatter(
-                x=t_df[trend_col],
-                y=t_df["遠創合計"],
-                name="遠創合計",
-                line=dict(width=3),
-                fill="tozeroy",
-                fillcolor="rgba(16,185,129,0.05)",
-            )
-        )
-        fig_trend.update_layout(
-            height=320,
-            margin=dict(l=0, r=0, t=0, b=0),
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-        )
+        fig_trend.add_trace(go.Scatter(x=t_df[trend_col], y=t_df["遠通合計"], name="遠通合計", line=dict(width=3), fill="tozeroy", fillcolor="rgba(59,130,246,0.05)"))
+        fig_trend.add_trace(go.Scatter(x=t_df[trend_col], y=t_df["遠創合計"], name="遠創合計", line=dict(width=3), fill="tozeroy", fillcolor="rgba(16,185,129,0.05)"))
+        fig_trend.update_layout(height=320, margin=dict(l=0, r=0, t=0, b=0), hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig_trend, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
         st.markdown('<div class="content-card"><div class="card-title">服務費組成佔比</div>', unsafe_allow_html=True)
-        pie_df = pd.DataFrame(
-            {"類別": ["遠通臨停", "遠通月租", "遠創臨停", "遠創月租"], "金額": [v1, v2, v3, v4]}
-        )
+        pie_df = pd.DataFrame({"類別": ["遠通臨停", "遠通月租", "遠創臨停", "遠創月租"], "金額": [v1, v2, v3, v4]})
         fig_pie = px.pie(pie_df, values="金額", names="類別", hole=0.6)
         fig_pie.update_layout(height=320, margin=dict(l=0, r=0, t=0, b=0), showlegend=True)
         st.plotly_chart(fig_pie, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="content-card"><div class="card-title">前 10 大貢獻業者排行榜</div>', unsafe_allow_html=True)
-    top_sites = (
-        filtered_df.groupby("業者", dropna=False)["總服務費"]
-        .sum()
-        .reset_index()
-        .sort_values("總服務費", ascending=False)
-        .head(10)
-    )
+    top_sites = filtered_df.groupby("業者", dropna=False)["總服務費"].sum().reset_index().sort_values("總服務費", ascending=False).head(10)
     top_sites.insert(0, "排名", range(1, len(top_sites) + 1))
     top_sites["佔比"] = (top_sites["總服務費"] / v_total * 100).round(1).astype(str) + "%" if v_total else "0.0%"
-    st.dataframe(
-        top_sites.style.format({"總服務費": "${:,.0f}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(top_sites.style.format({"總服務費": "{:,.0f}"}), use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 elif selected == "業者查詢":
     st.markdown("<h2 style='color:#0f172a; font-size:2rem; margin-bottom:0.2rem;'>業者明細查詢</h2>", unsafe_allow_html=True)
-    st.markdown(
-        f"<p style='color:#64748b; font-size:1rem; margin-bottom:1.2rem;'>時間範圍：{selected_time if selected_time != '全部' else '歷史全紀錄'}</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<p style='color:#64748b; font-size:1rem; margin-bottom:1.2rem;'>時間範圍：{selected_time if selected_time != '全部' else '歷史全紀錄'}</p>", unsafe_allow_html=True)
 
     search_query = st.text_input("🔍 輸入關鍵字搜尋業者 (例如：俥亭、萊爾富)", "", help="輸入業者名稱關鍵字進行搜尋")
 
-    all_sites = sorted(df["業者"].dropna().astype(str).unique().tolist())
-    if selected_time != "全部":
-        all_sites = sorted(filtered_df["業者"].dropna().astype(str).unique().tolist())
-
+    all_sites = sorted((filtered_df if selected_time != "全部" else df)["業者"].dropna().astype(str).unique().tolist())
     if search_query:
         all_sites = [s for s in all_sites if search_query.lower() in s.lower()]
 
@@ -511,7 +475,6 @@ elif selected == "業者查詢":
         site_data = filtered_df[filtered_df["業者"].astype(str) == str(target_site)].sum(numeric_only=True)
 
         st.markdown(f"<h3 style='font-size:1.5rem;'>{target_site}</h3>", unsafe_allow_html=True)
-
         col2, col3 = st.columns(2)
 
         with col2:
@@ -519,14 +482,14 @@ elif selected == "業者查詢":
                 f"""
                 <div class="detail-section">
                     <div class="detail-header">遠創系列</div>
-                    <div class="detail-row"><span class="detail-label">APS 繳費機 (非現金)</span><span class="detail-value">{money(site_data.get("APS繳費機(非現金)", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">APS 繳費機 (現金)</span><span class="detail-value">{money(site_data.get("APS繳費機(現金)", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">APS 繳費機 (非代收)</span><span class="detail-value">{money(site_data.get("APS繳費機(非代收)", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">uTagGO 易付</span><span class="detail-value">{money(site_data.get("uTagGO易付", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">uTagGO 停車</span><span class="detail-value">{money(site_data.get("uTagGO停車", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">遠創中獎通知</span><span class="detail-value">{money(site_data.get("遠創中獎通知", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">充電費</span><span class="detail-value">{money(site_data.get("充電費", 0))}</span></div>
-                    <div class="detail-row"><span class="detail-label">月租代收應收服務費</span><span class="detail-value">{money(site_data.get("月租代收應收服務費", 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">APS 繳費機 (非現金)</span><span class="detail-value">{money(site_data.get('APS繳費機(非現金)', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">APS 繳費機 (現金)</span><span class="detail-value">{money(site_data.get('APS繳費機(現金)', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">APS 繳費機 (非代收)</span><span class="detail-value">{money(site_data.get('APS繳費機(非代收)', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">uTagGO 易付</span><span class="detail-value">{money(site_data.get('uTagGO易付', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">uTagGO 停車</span><span class="detail-value">{money(site_data.get('uTagGO停車', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">遠創中獎通知</span><span class="detail-value">{money(site_data.get('遠創中獎通知', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">充電費</span><span class="detail-value">{money(site_data.get('充電費', 0))}</span></div>
+                    <div class="detail-row"><span class="detail-label">月租代收應收服務費</span><span class="detail-value">{money(site_data.get('月租代收應收服務費', 0))}</span></div>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -552,6 +515,6 @@ elif selected == "業者查詢":
 
 else:
     st.markdown("<h2 style='color:#0f172a; font-size:2rem; margin-bottom:0.2rem;'>資料匯入</h2>", unsafe_allow_html=True)
-    st.info("這個版本支援直接上傳 Excel，不需要把檔案放在固定路徑。上傳後會立即重新整理整個網站。")
-    if st.session_state.get("uploaded_file") is not None:
-        st.success(f"目前已載入：{st.session_state['uploaded_file']['name']}")
+    st.info("這個版本支援直接上傳 Excel，不需要把檔案放在固定路徑。")
+    st.write(f"目前資料列數：{len(df):,}")
+
